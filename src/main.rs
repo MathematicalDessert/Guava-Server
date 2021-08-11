@@ -1,9 +1,9 @@
 use std::env;
-use serde_json::{self, Value};
+use serde_json::{self, Map, Value};
 use tide::{Request, Response, StatusCode, prelude::*};
 use lazy_static::lazy_static;
 use futures::{stream::TryStreamExt};
-use mongodb::{Client, Collection, bson::doc, options::{ClientOptions, FindOptions}};
+use mongodb::{Client, Collection, bson::doc, options::{ClientOptions, FindOptions, FindOneOptions}};
 
 lazy_static! {
     static ref MONGO_HOST: String = env::var("MONGO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -44,13 +44,20 @@ struct GuavaPlaylistLight {
     identifier: String,
 }
 
-async fn generate_response(status_code: StatusCode, result: Option<Value>) -> Response {
+async fn generate_response(status_code: StatusCode, result: Option<Value>, error: Option<String>) -> Response {
+    let mut map = Map::new();
+    map.insert(String::from("success"), Value::Bool(status_code.is_success()));
+    
+
+    if status_code.is_success() {
+        map.insert(String::from("result"), result.unwrap_or(serde_json::json!({})));
+    } else {
+        map.insert(String::from("error"), Value::String(error.unwrap_or("Internal Server Error".to_string())));
+    }
+
     Response::builder(status_code)
         .header("Content-Type", "application/json")
-        .body(serde_json::json!({
-            "success": status_code.is_success(),
-            "result": result.unwrap_or(serde_json::json!({})),
-        }))
+        .body(serde_json::to_string(&Value::Object(map)).unwrap())
         .build()
 }
 
@@ -75,22 +82,34 @@ async fn list_playlist(req: Request<State>) -> tide::Result {
     let results = playlist_collection.find(None, find_options).await?;
     let playlists = results.try_collect().await.unwrap_or_else(|_| vec![]);
     
-    Ok(generate_response(StatusCode::Ok, Some(serde_json::value::to_value(playlists).unwrap())).await)
+    Ok(generate_response(StatusCode::Ok, Some(serde_json::value::to_value(playlists).unwrap()), None).await)
 }
 
 /// Get playlist
 /// 
 /// Returns list of content under a given playlist
 async fn get_playlist_content(req: Request<State>) -> tide::Result {
+    let db = &req.state().db;
+    let playlist_collection: Collection<GuavaPlaylist> = db.collection("playlist"); 
+
     match req.param("name") {
         Ok(playlist_name) => {
-            let response: Value = serde_json::json!({
-                "title": playlist_name
-            });
+            // TODO: project results to ignore name + identifier.
 
-            Ok(generate_response(StatusCode::Ok, Some(response)).await)
+            let res = playlist_collection.find_one(doc! { "identifier": playlist_name }, None).await;
+            if res.is_err() {
+                Ok(generate_response(StatusCode::InternalServerError, None::<Value>, None).await)
+            } else {
+                match res.ok() {
+                    Some(playlist) => {
+                        Ok(generate_response(StatusCode::Ok, Some(serde_json::value::to_value(playlist).unwrap()), None).await)
+                    },
+                    None => Ok(generate_response(StatusCode::NoContent, None::<Value>, None).await)
+                }
+            }
+
         },
-        Err(_) => Ok(generate_response(StatusCode::BadRequest, None::<Value>).await)
+        Err(_) => Ok(generate_response(StatusCode::BadRequest, None::<Value>, None).await)
     }
 }
 
