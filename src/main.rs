@@ -1,9 +1,13 @@
+pub mod service;
+
 use std::env;
+use async_std::{path::PathBuf};
 use serde_json::{self, Map, Value};
-use tide::{Request, Response, StatusCode, prelude::*};
+use tide::{Body, Request, Response, StatusCode, prelude::*};
 use lazy_static::lazy_static;
 use futures::{stream::TryStreamExt};
-use mongodb::{Client, Collection, bson::doc, options::{ClientOptions, FindOptions, FindOneOptions}};
+use mongodb::{Client, Collection, bson::doc, options::{ClientOptions}};
+use crate::service::content_service::{ContentService, GuavaContentType};
 
 lazy_static! {
     static ref MONGO_HOST: String = env::var("MONGO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -14,34 +18,21 @@ lazy_static! {
 #[derive(Clone)]
 struct State {
     db: mongodb::Database,
+    content_service: ContentService,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[repr(u32)]
-enum GuavaContentType {
-    None = 0,
-    Sound = 1,
-    Video = 2,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct GuavaContent {
-    content_type: GuavaContentType,
+struct PlaylistContent {
     name: String,
-    hash: String,
+    content_type: GuavaContentType,
+    content_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GuavaPlaylist {
     name: String,
     identifier: String,
-    content: Option<Vec<GuavaContent>>
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct GuavaPlaylistLight {
-    name: String,
-    identifier: String,
+    content: Option<Vec<PlaylistContent>>
 }
 
 async fn generate_response(status_code: StatusCode, result: Option<Value>, error: Option<String>) -> Response {
@@ -61,55 +52,39 @@ async fn generate_response(status_code: StatusCode, result: Option<Value>, error
         .build()
 }
 
-#[derive(Serialize, Deserialize)]
-struct ListPlaylistResponse {
-    name: String,
-    identifier: String
-}
-
 /// List playlist
 /// 
 /// Lists names of all known playlists
 async fn list_playlist(req: Request<State>) -> tide::Result {
     let db = &req.state().db;
-    let playlist_collection: Collection<GuavaPlaylistLight> = db.collection("playlist"); 
+    let playlist_collection: Collection<GuavaPlaylist> = db.collection("playlist"); 
 
-    let find_options = FindOptions::builder()
-        .projection(doc! [
-            "content": false,
-        ]).build();
-
-    let results = playlist_collection.find(None, find_options).await?;
+    let results = playlist_collection.find(None, None).await?;
     let playlists = results.try_collect().await.unwrap_or_else(|_| vec![]);
     
     Ok(generate_response(StatusCode::Ok, Some(serde_json::value::to_value(playlists).unwrap()), None).await)
 }
 
-/// Get playlist
-/// 
-/// Returns list of content under a given playlist
-async fn get_playlist_content(req: Request<State>) -> tide::Result {
-    let db = &req.state().db;
-    let playlist_collection: Collection<GuavaPlaylist> = db.collection("playlist"); 
+async fn download_asset(req: Request<State>) -> tide::Result {
+    let content_service  = &req.state().content_service;
 
-    match req.param("name") {
-        Ok(playlist_name) => {
-            // TODO: project results to ignore name + identifier.
-
-            let res = playlist_collection.find_one(doc! { "identifier": playlist_name }, None).await;
-            if res.is_err() {
-                Ok(generate_response(StatusCode::InternalServerError, None::<Value>, None).await)
-            } else {
-                match res.ok() {
-                    Some(playlist) => {
-                        Ok(generate_response(StatusCode::Ok, Some(serde_json::value::to_value(playlist).unwrap()), None).await)
-                    },
-                    None => Ok(generate_response(StatusCode::NoContent, None::<Value>, None).await)
-                }
+    match content_service.get_hash_from_id(req.param("id").unwrap().to_string()).await {
+        Ok(hash) => {
+            match Body::from_file(PathBuf::from("content/".to_string().to_owned() + &hash.to_owned())).await {
+                Ok(body) => Ok(Response::builder(StatusCode::Ok).body(body).build()),
+                Err(_) => Ok(generate_response(StatusCode::NotFound, None::<Value>, Some(String::from("file not found"))).await)
             }
-
         },
-        Err(_) => Ok(generate_response(StatusCode::BadRequest, None::<Value>, None).await)
+        Err(_) => Ok(generate_response(StatusCode::NotFound, None::<Value>, Some(String::from("file not found"))).await),
+    }
+}
+
+async fn get_hash_of_content(req: Request<State>) -> tide::Result {
+    let content_service = &req.state().content_service;
+    
+    match content_service.get_hash_from_id(req.param("id").unwrap().to_string()).await {
+        Ok(hash) => Ok(generate_response(StatusCode::Ok, Some(serde_json::Value::String(String::from(hash))), None).await),
+        Err(_) => Ok(generate_response(StatusCode::NotFound, None::<Value>, Some(String::from("content not found"))).await),
     }
 }
 
@@ -127,13 +102,27 @@ async fn main() -> tide::Result<()> {
         Err(e) => panic!("Failed to open connection to database! Reason: {}", e),
     };
 
-    let state: State = State { db: db_client.database("guava") };
+    let state: State = State { 
+        db: db_client.database("guava"),
+        content_service: ContentService::new(db_client.database("guava"))
+    };
     
     let mut app = tide::with_state(state);
+    app.with(tide::log::LogMiddleware::new()); 
+
+    tide::log::start();
 
     // list playlists
-    app.at("/playlist").get(list_playlist);
-    app.at("/playlist/:name/content").get(get_playlist_content);
+
+    // index
+    app.at("/").get(|_| async move { Ok(String::from("OK")) });
+
+    // content
+    app.at("/content/:id/hash").get(get_hash_of_content);
+    app.at("/content/:id/download").get(download_asset);
+
+    // playlist
+    app.at("/playlists").get(list_playlist);
 
     app.listen("127.0.0.1:8080").await?;
     Ok(())
